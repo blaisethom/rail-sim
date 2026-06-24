@@ -33,6 +33,7 @@ def simulate_train(
         actual_ms = stops[i]["ts_ms"]
         predictions.append({
             "stanox": to_stanox,
+            "stop_index": i,
             "predicted_ms": predicted_ms,
             "actual_ms": actual_ms,
         })

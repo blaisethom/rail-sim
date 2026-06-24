@@ -25,6 +25,8 @@ class Network:
         self._timing: dict[str, int] = data["stanox_timing"]
         self._coords: dict[str, list[float]] = data["stanox_coords"]
         self._names: dict[str, str] = data["stanox_names"]
+        # TIPLOC → STANOX mapping (optional — absent in old network.json files)
+        self.tiploc_stanox: dict[str, str] = data.get("tiploc_stanox", {})
 
     def running_time(self, from_stanox: str, to_stanox: str) -> int:
         """Return estimated running time in seconds between two STANOXes."""
@@ -53,6 +55,7 @@ class Network:
                 "stanox_timing": self._timing,
                 "stanox_coords": self._coords,
                 "stanox_names": self._names,
+                "tiploc_stanox": self.tiploc_stanox,
             }, f)
 
     @classmethod
@@ -92,4 +95,5 @@ class Network:
             "stanox_timing": timing,
             "stanox_coords": coords,
             "stanox_names": corpus["stanox_name"],
+            "tiploc_stanox": corpus["tiploc_stanox"],
         })

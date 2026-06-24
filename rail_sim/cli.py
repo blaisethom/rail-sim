@@ -26,7 +26,7 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     from rail_sim.model import Network
     from rail_sim.observations import load_observations
     from rail_sim.sim import simulate_all
-    from rail_sim.validate import compute_metrics, metrics_by_toc, print_report
+    from rail_sim.validate import compute_metrics, metrics_by_toc, print_report, print_comparison
 
     net = Network.load(args.network)
     print(f"Loading observations for {args.date}…")
@@ -37,6 +37,9 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     metrics = compute_metrics(preds)
     by_toc = metrics_by_toc(preds)
     print_report(metrics, by_toc)
+
+    if args.darwin_db:
+        _print_darwin_comparison(args.darwin_db, args.date, net, metrics, args.tz_offset)
 
     if args.out:
         out = {
@@ -76,6 +79,27 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     save_model(args.out, best_scale, best_metrics, trained_on=args.date)
 
 
+def _print_darwin_comparison(darwin_db: str, date_str: str, net, sim_metrics: dict, tz_offset: int) -> None:
+    """Load Darwin baseline for date_str and print side-by-side comparison."""
+    from rail_sim.darwin_baseline import load_darwin_baseline
+    from rail_sim.validate import compute_metrics, print_comparison
+
+    tiploc_stanox = net.tiploc_stanox
+    if not tiploc_stanox:
+        print("  (Darwin comparison skipped: rebuild network with --rebuild to include TIPLOC→STANOX mapping)")
+        return
+
+    print(f"\nLoading Darwin baseline from {darwin_db} for {date_str}…")
+    baseline = load_darwin_baseline(darwin_db, date_str, tiploc_stanox, tz_hours=tz_offset)
+    if not baseline:
+        print("  No Darwin↔NROD matched predictions found for this date.")
+        print("  Run tools/build_links.py and ensure darwin_ingest is collecting data.")
+        return
+    print(f"  {len(baseline)} Darwin predictions matched to NROD observations")
+    darwin_metrics = compute_metrics(baseline)
+    print_comparison(sim_metrics, darwin_metrics)
+
+
 def cmd_run_all(args: argparse.Namespace) -> None:
     """Build network, calibrate on train_date, validate on val_date."""
     import os
@@ -113,8 +137,47 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     by_toc = metrics_by_toc(preds)
     print_report(metrics, by_toc)
 
+    # Timetable baseline (scheduled vs actual from NROD payload)
+    from rail_sim.observations import timetable_baseline
+    from rail_sim.validate import compute_bias, compute_by_stop_index, print_comparison
+    tt_preds = timetable_baseline(val_obs)
+    tt_metrics = compute_metrics(tt_preds) if tt_preds else {}
+
+    # Bias report
+    bias = compute_bias(preds)
+    print(f"\n--- Bias ({args.val_date}) ---")
+    print(f"  Mean signed error : {bias.get('mean_bias_s', '?')} s  (+ = sim predicts late)")
+    print(f"  Median signed error: {bias.get('median_bias_s', '?')} s")
+    print(f"  Predicted late (>30s): {bias.get('late_pct', '?')} %")
+    print(f"  Predicted early (<-30s): {bias.get('early_pct', '?')} %")
+
+    # Error by stop index
+    by_idx = compute_by_stop_index(preds)
+    if by_idx:
+        print("\n--- Error by stop index (does it compound?) ---")
+        print(f"  {'Stop':<6} {'n':>6} {'MAE (s)':>9}")
+        for row in by_idx[:10]:
+            print(f"  {row['stop_index']:<6} {row['n']:>6,} {row['mae_s']:>9.1f}")
+        if len(by_idx) > 10:
+            print(f"  ... ({len(by_idx)} total stop positions)")
+
     print(f"\nDone. Calibrated model: time_scale={best_scale}, MAE={best_metrics.get('mae_s')}s (train)")
     print(f"Held-out validation:   MAE={metrics.get('mae_s')}s")
+
+    if args.darwin_db:
+        from rail_sim.darwin_baseline import load_darwin_baseline
+        tiploc_stanox = net.tiploc_stanox
+        if tiploc_stanox:
+            print(f"\nLoading Darwin baseline from {args.darwin_db} for {args.val_date}…")
+            baseline = load_darwin_baseline(args.darwin_db, args.val_date, tiploc_stanox, tz_hours=args.tz_offset)
+            darwin_metrics = compute_metrics(baseline) if baseline else {}
+            if baseline:
+                print(f"  {len(baseline)} Darwin predictions matched to NROD")
+            print_comparison(metrics, darwin_metrics or None, tt_metrics or None)
+        else:
+            print("  (Darwin comparison skipped: rebuild network to include TIPLOC→STANOX)")
+    elif tt_metrics:
+        print_comparison(metrics, timetable_metrics=tt_metrics)
 
 
 def main() -> None:
@@ -134,6 +197,8 @@ def main() -> None:
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
     p.add_argument("--time-scale", type=float, default=1.0)
     p.add_argument("--out", default=None, help="Save predictions JSON")
+    p.add_argument("--darwin-db", default=None, help="Path to railmetrics.db for Darwin baseline comparison")
+    p.add_argument("--tz-offset", type=int, default=1, help="Darwin timezone offset hours (1=BST, 0=GMT)")
 
     # validate
     p = sub.add_parser("validate", help="Print metrics from a saved simulation JSON")
@@ -155,6 +220,8 @@ def main() -> None:
     p.add_argument("--val-date", required=True, help="Validation date YYYY-MM-DD")
     p.add_argument("--data-dir", default="data")
     p.add_argument("--rebuild", action="store_true", help="Force rebuild of network.json")
+    p.add_argument("--darwin-db", default=None, help="Path to railmetrics.db for Darwin baseline comparison")
+    p.add_argument("--tz-offset", type=int, default=1, help="Darwin timezone offset hours (1=BST, 0=GMT)")
 
     args = parser.parse_args()
     dispatch = {
