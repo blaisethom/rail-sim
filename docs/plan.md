@@ -184,7 +184,95 @@ All of these should be configurable (e.g. a TOML config file or CLI flags):
 }
 ```
 
-### Phase 4 — Validation against real data
+### Phase 4 — Validation against Darwin baseline
+
+**Goal**: Compare simulated movements against both (a) the observed NROD movements in rail-data and (b) the predictions already made by Darwin, which is Network Rail's own real-time prediction system. Darwin is the industry baseline — if our model can match or beat it, that is a meaningful result.
+
+**What Darwin is**: Darwin is Network Rail's journey information system. It ingests CIF timetable data and real-time TRUST movement reports and produces continuously-updated predicted arrival/departure times for every train at every stop. These predictions are what National Rail Enquiries displays on departure boards. Darwin Push Port publishes an XML feed of these predictions via STOMP (same protocol as NROD).
+
+**Darwin data access**:
+- Register at the Darwin Data Feeds portal (linked from networkrail.co.uk/open-data-feeds)
+- Subscribe to the Darwin Push Port: `darwin.pushport.v16` feed (XML, STOMP)
+- Alternatively, the OpenLDBWS SOAP API (free, rate-limited) returns Darwin predictions per-station
+- The rail-data pipeline can be extended to simultaneously ingest Darwin predictions alongside TRUST movement reports
+
+**Validation strategy**:
+
+| Comparison | What it measures |
+|-----------|-----------------|
+| Our sim vs actual NROD | Absolute timing error of our physics model |
+| Darwin vs actual NROD | Darwin's prediction accuracy (the industry baseline) |
+| Our sim vs Darwin | Whether we are better or worse than the current system |
+
+If Darwin is systematically more accurate, the gap reveals what information we lack (typically: knowledge of current network congestion, signal state, and TSR speed restrictions). If our model is within Darwin's error envelope, it is potentially useful as a standalone predictor.
+
+**Deliverables**:
+- Extend rail-data to optionally capture Darwin predictions alongside NROD movements
+- `rail_sim/validate/darwin.py` — join Darwin predicted times to NROD actual times and rail-sim predicted times, compute comparative metrics
+
+**Note on TIPLOC↔STANOX join**: NROD reports STANOX; simulated events report TIPLOC. CORPUS provides the mapping. Some STANOXes map to multiple TIPLOCs (e.g. large stations); the join will need fuzzy matching by time window.
+
+### Phase 5 — Baseline calibration
+
+**Goal**: Use observed data to tune model parameters (speed scaling, recovery factor, dwell times) so that the simulator's predictions converge toward observed reality.
+
+**Current result** (first trained model, June 2026):
+- Calibrated `time_scale = 1.0` — BPLAN timing links are accurate for typical UK running conditions
+- Training MAE: 91.7s, Held-out MAE: 95.8s (June 23 → June 24)
+- 67% of stop predictions within 60s, 95% within 5 minutes
+- The residual ~92s error is dominated by variable dwell times, signal holds, and unmodelled delay propagation
+
+**Approach** (current):
+1. Run the simulator with default parameters; record error metrics
+2. Use a grid search to optimise `time_scale` (and later, per-TOC scales) against the MAE metric on a training day
+3. Persist the calibrated parameters in `data/model.json`
+4. Repeat as new days of data accumulate
+
+### Phase 6 — ML-based prediction: GNN and spatio-temporal transformer
+
+**Goal**: Replace or augment the physics-based running-time model with a learned model capable of capturing network-wide delay propagation — the effect where a delay at one station ripples to downstream stations and connecting services.
+
+**Why the physics model has a ceiling**: The BPLAN timing model assumes each leg runs at its scheduled speed independent of all other trains. In reality, delays propagate: a late train blocks a platform, its passengers miss connections, the connecting service waits and incurs a secondary delay. These effects are spatial (nearby stations are correlated) and temporal (current delays are correlated with past delays).
+
+#### Option A: Graph Neural Network (GNN)
+
+**Architecture**:
+- **Nodes**: stations / STANOXes, each with a feature vector: current delay (seconds), time of day, day of week, TOC
+- **Edges**: track connections (from BPLAN NWK), with edge features: scheduled running time, distance, current occupancy (number of trains on the edge)
+- **Message passing**: for each prediction step, each node aggregates delay information from its neighbours, weighted by edge running times; this propagates delay signals through the network
+- **Output**: predicted delay at each node for the next N minutes
+
+**Why GNN fits here**: The UK rail network is naturally a graph. Delay propagation is a message-passing process — exactly what GNNs are designed to model. Edge structure is provided by BPLAN; node state comes from NROD observations.
+
+**Libraries**: PyTorch Geometric (`torch_geometric`) or DGL. Both support sparse graph convolution at UK-network scale (~4,500 active STANOXes).
+
+**Training data requirements**: Weeks of NROD movement data (the rail-data pipeline is already collecting this). Each training example is a network snapshot (delay vector at all nodes at time T) with a target (delay vector at time T+Δ).
+
+#### Option B: Spatio-temporal transformer
+
+**Architecture**:
+- **Token**: one (train, STANOX) pair = one token
+- **Spatial attention**: a token attends to other tokens at nearby STANOXes on the same time step — learns which stations are correlated
+- **Temporal attention**: a token attends to the same (train, STANOX) token across past time steps — learns how a train's delay history predicts its future
+- **Positional encoding**: STANOX lat/lon encoded as a 2D position; time encoded as sinusoidal
+
+**Why transformer fits here**: Transformers naturally handle variable-length sequences and can learn long-range dependencies. A train running from London to Edinburgh can attend to the state of intermediate stations even when they are many edges apart in the graph.
+
+**Libraries**: Standard PyTorch; no graph library needed. Sequence length = number of calling points × history window.
+
+#### Comparison to Darwin
+
+Both architectures, once trained, produce predicted arrival times. The comparison target is Darwin's predictions (Phase 4). Darwin uses a rule-based system seeded by TRUST movement data. The GNN/transformer can potentially outperform it by:
+1. Learning delay correlation patterns across the network (Darwin's rules are local)
+2. Incorporating longer historical context than Darwin's rolling window
+
+#### Recommended sequencing
+
+1. Complete Phase 5 calibration with several weeks of data
+2. Implement Darwin ingestion (Phase 4) to establish the comparison baseline
+3. Train a GNN as Phase 6a — simpler to implement, natural fit for the graph structure
+4. Train a transformer as Phase 6b — higher ceiling but more data-hungry
+5. Evaluate both against Darwin on held-out weeks; ensemble if both add signal
 
 **Goal**: Compare simulated movements with the observed movements stored in the rail-data SQLite database. Produce per-service and aggregate accuracy metrics.
 
@@ -200,17 +288,10 @@ All of these should be configurable (e.g. a TOML config file or CLI flags):
 
 **Note on TIPLOC↔STANOX join**: NROD reports STANOX; simulated events report TIPLOC. CORPUS provides the mapping. Some STANOXes map to multiple TIPLOCs (e.g. large stations); the join will need fuzzy matching by time window.
 
-### Phase 5 — Calibration
-
-**Goal**: Use observed data to tune model parameters (speed scaling, recovery factor, dwell times) so that the simulator's predictions converge toward observed reality.
-
-**Approach**:
-1. Run the simulator with default parameters; record error metrics
-2. Use scipy `minimize` (or a simple grid search to start) to optimise the parameter set against the MAE metric on a held-out validation day
-3. Persist the calibrated parameters in `calibrated.toml`
-4. Repeat as new days of data accumulate
-
-**Longer-term ML path**: Once we have enough observations (months of NROD data), replace the physics-based running-time calculation with a learned model (e.g. a gradient-boosted regression trained on edge×train-class→actual running time pairs). The simulator becomes a hybrid: physics for structure, ML for prediction.
+**Longer-term calibration extensions**:
+- Per-TOC `time_scale` values (the current TOC breakdown shows wide variation: TOC 30 at 52s MAE vs TOC 40 at 1325s MAE)
+- Per-edge running time corrections learned from observed (from_stanox, to_stanox, actual_seconds) pairs
+- Time-of-day effects (peak vs off-peak)
 
 ---
 
@@ -257,17 +338,39 @@ rail-sim/
 
 ---
 
+## Current results (baseline model, June 2026)
+
+First trained model on real NROD data:
+
+| Metric | Training (Jun 23) | Held-out (Jun 24) |
+|--------|------------------|------------------|
+| Predictions | 185,965 | 87,870 |
+| MAE | 91.7 s | 95.8 s |
+| RMSE | 223.9 s | 293.9 s |
+| Median error | 60 s | 60 s |
+| Within 60s | 65.8% | 66.9% |
+| Within 120s | 84.2% | 84.8% |
+| Within 300s | 96.0% | 95.7% |
+
+Calibrated `time_scale = 1.0` — BPLAN timing links already model typical UK rail running times accurately. The residual error is predominantly variable dwell times, signal holds, and delay propagation (none of which the physics model captures). The next benchmark is Darwin's prediction accuracy on the same days.
+
+---
+
 ## Open questions
 
 1. **BPLAN licence**: the BPLAN in rail-data was presumably obtained under the NROD / Rail Data Marketplace terms. Confirm that licence permits use in a separate (potentially public) repository, or keep the parsed network output (not the raw BPLAN) in rail-sim.
 
 2. **CIF source**: decide whether to use the NROD CIF download or the open alternative at opendata.nationalrail.co.uk. The latter does not require an NROD subscription but may lag by a day.
 
-3. **Simulation granularity**: BPLAN Timing Links are at TIPLOC level, but signals (berths) are finer-grained. Do we want signal-level simulation (needs TD feed + SMART database) or TIPLOC-level (simpler, enough for Phase 1–4)?
+3. **Simulation granularity**: BPLAN Timing Links are at TIPLOC level, but signals (berths) are finer-grained. Do we want signal-level simulation (needs TD feed + SMART database) or TIPLOC-level (simpler, enough for Phase 1–5)?
 
 4. **OSRD interop**: OSRD is an active open-source project with a similar mission. Worth periodically checking whether their infrastructure format (which is evolving toward railML) becomes stable enough to target as an export format from this project.
 
 5. **Real-time mode**: The simulator runs over a historical day in batch. A stretch goal is a real-time mode that ingests live NROD events and continuously updates predicted future positions for all active trains.
+
+6. **Darwin data registration**: Darwin Push Port requires a separate registration from NROD (though the same Network Rail account is used). This should be set up as soon as possible so we can accumulate Darwin prediction data alongside NROD actuals for comparison.
+
+7. **GNN vs transformer data requirements**: The GNN approach is viable with weeks of data; the transformer likely needs months for the temporal attention patterns to be meaningful. Phase 6a (GNN) should be started once ~4 weeks of NROD data are available.
 
 ---
 
@@ -282,3 +385,6 @@ rail-sim/
 | VectorLinks (GIS) | https://github.com/openraildata/network-rail-gis | Geospatial track data |
 | OSRD | https://github.com/OpenRailAssociation/osrd | Open-source rail simulation platform |
 | NROD feeds | https://datafeeds.networkrail.co.uk | CIF, CORPUS, TD downloads |
+| Darwin Open Data | https://www.networkrail.co.uk/who-we-are/transparency-and-ethics/transparency/open-data-feeds/ | Darwin Push Port registration |
+| OpenLDBWS (Darwin API) | https://lite.realtime.nationalrail.co.uk/OpenLDBWS/ | SOAP API for Darwin predictions (rate-limited, free) |
+| PyTorch Geometric | https://pytorch-geometric.readthedocs.io | GNN library for Phase 6a |
