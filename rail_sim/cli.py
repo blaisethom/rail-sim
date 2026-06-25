@@ -143,6 +143,11 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     tt_preds = timetable_baseline(val_obs)
     tt_metrics = compute_metrics(tt_preds) if tt_preds else {}
 
+    # Horizon breakdown
+    from rail_sim.validate import compute_metrics_by_horizon, print_horizon_table
+    horizon_rows = compute_metrics_by_horizon(preds)
+    print_horizon_table(horizon_rows, source_label="Rail-sim")
+
     # Bias report
     bias = compute_bias(preds)
     print(f"\n--- Bias ({args.val_date}) ---")
@@ -165,15 +170,23 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     print(f"Held-out validation:   MAE={metrics.get('mae_s')}s")
 
     if args.darwin_db:
-        from rail_sim.darwin_baseline import load_darwin_baseline
+        from rail_sim.darwin_baseline import load_darwin_baseline, load_darwin_horizon_predictions
         tiploc_stanox = net.tiploc_stanox
         if tiploc_stanox:
             print(f"\nLoading Darwin baseline from {args.darwin_db} for {args.val_date}…")
             baseline = load_darwin_baseline(args.darwin_db, args.val_date, tiploc_stanox, tz_hours=args.tz_offset)
             darwin_metrics = compute_metrics(baseline) if baseline else {}
             if baseline:
-                print(f"  {len(baseline)} Darwin predictions matched to NROD")
+                print(f"  {len(baseline)} Darwin last-known predictions matched to NROD")
             print_comparison(metrics, darwin_metrics or None, tt_metrics or None)
+
+            # Darwin horizon breakdown (requires prediction history)
+            dar_horizon = load_darwin_horizon_predictions(args.darwin_db, args.val_date, tiploc_stanox, tz_hours=args.tz_offset)
+            if dar_horizon:
+                dar_h_rows = compute_metrics_by_horizon(dar_horizon)
+                print_horizon_table(dar_h_rows, source_label="Darwin")
+            else:
+                print("  (Darwin horizon breakdown not available — prediction history accumulates from today)")
         else:
             print("  (Darwin comparison skipped: rebuild network to include TIPLOC→STANOX)")
     elif tt_metrics:

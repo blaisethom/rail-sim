@@ -180,3 +180,118 @@ def load_darwin_baseline(
         })
 
     return results
+
+
+def load_darwin_horizon_predictions(
+    db_path: str,
+    date_str: str,
+    tiploc_stanox: dict[str, str],
+    tz_hours: int = 1,
+) -> list[dict]:
+    """
+    Load Darwin prediction history snapshots for horizon analysis.
+
+    For each snapshot in darwin_prediction_history, paired with a known
+    NROD actual time for the same (train_id, stanox), returns:
+
+        {
+            'predicted_ms': int,   # Darwin ETA at snapshot_at
+            'actual_ms':    int,   # NROD actual movement time
+            'horizon_s':    int,   # actual_ms - snapshot_at (seconds before event)
+            'stanox':       str,
+            'tiploc':       str,
+            'train_id':     str,
+            'rid':          str,
+            'toc_id':       str,
+        }
+
+    horizon_s = how many seconds before the event Darwin issued this prediction.
+    Groups into the same HORIZON_BUCKETS used for rail-sim.
+    Requires darwin_prediction_history table (populated by darwin_ingest >= this version).
+    """
+    links = _load_links(db_path, date_str)
+    if not links:
+        return []
+
+    rid_to_train: dict[str, tuple[str, str]] = {
+        rid: (train_id, toc_id)
+        for train_id, (rid, toc_id) in links.items()
+    }
+    rids = list(rid_to_train.keys())
+
+    conn = sqlite3.connect(db_path)
+
+    # Check history table exists
+    has_history = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='darwin_prediction_history'"
+    ).fetchone()
+    if not has_history:
+        conn.close()
+        return []
+
+    placeholders = ",".join("?" * len(rids))
+
+    # Load all history snapshots for these RIDs, joined to schedule date
+    history_rows = conn.execute(
+        f"""
+        SELECT h.rid, h.tiploc, h.eta, h.etd, h.snapshot_at, ds.ssd
+        FROM darwin_prediction_history h
+        JOIN darwin_schedules ds ON h.rid = ds.rid AND h.tiploc = ds.tiploc
+        WHERE h.rid IN ({placeholders})
+        """,
+        rids,
+    ).fetchall()
+
+    # NROD actuals
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    day_start = int(dt.timestamp() * 1000)
+    day_end = day_start + 86_400_000
+    train_ids = list(links.keys())
+    placeholders2 = ",".join("?" * len(train_ids))
+    mv_rows = conn.execute(
+        f"""
+        SELECT train_id, stanox, MIN(timestamp_ms)
+        FROM raw_movements
+        WHERE msg_type = '0003'
+          AND timestamp_ms >= ? AND timestamp_ms < ?
+          AND train_id IN ({placeholders2})
+          AND stanox IS NOT NULL AND stanox != '' AND stanox != '00000'
+        GROUP BY train_id, stanox
+        """,
+        [day_start, day_end] + train_ids,
+    ).fetchall()
+    conn.close()
+
+    nrod_actual: dict[tuple[str, str], int] = {
+        (tid, st.strip()): ts for tid, st, ts in mv_rows if st
+    }
+
+    results = []
+    for rid, tiploc, eta, etd, snapshot_at, ssd in history_rows:
+        stanox = tiploc_stanox.get(tiploc)
+        if not stanox:
+            continue
+        train_id, toc_id = rid_to_train[rid]
+        actual_ms = nrod_actual.get((train_id, stanox))
+        if actual_ms is None:
+            continue
+        pred_ms = _hhmm_to_ms(eta or etd, ssd, tz_hours)
+        if pred_ms is None:
+            continue
+        # Overnight-wrap guard
+        if abs(pred_ms - actual_ms) > 6 * 3600 * 1000:
+            continue
+        snapshot_ms = snapshot_at * 1000
+        horizon_s = max(0, (actual_ms - snapshot_ms) // 1000)
+        results.append({
+            "train_id":    train_id,
+            "rid":         rid,
+            "toc_id":      toc_id,
+            "stanox":      stanox,
+            "tiploc":      tiploc,
+            "predicted_ms": pred_ms,
+            "actual_ms":   actual_ms,
+            "horizon_s":   horizon_s,
+        })
+
+    return results

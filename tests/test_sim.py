@@ -4,7 +4,7 @@ import pytest
 
 from rail_sim.model import Network, haversine_seconds
 from rail_sim.sim import simulate_train, simulate_all
-from rail_sim.validate import compute_metrics
+from rail_sim.validate import compute_metrics, compute_metrics_by_horizon, compute_bias, HORIZON_BUCKETS
 from rail_sim.calibrate import calibrate
 
 
@@ -98,6 +98,83 @@ def test_compute_metrics_mixed():
     assert abs(m["mae_s"] - (30 + 90 + 200) / 3) < 0.1
     assert m["within_60s_pct"] == pytest.approx(33.3, abs=0.2)
     assert m["within_300s_pct"] == 100.0
+
+
+# --- horizon_s in predictions ---
+
+def test_simulate_emits_horizon_s():
+    net = make_network({("AAA", "BBB"): 300, ("BBB", "CCC"): 600})
+    stops = [
+        {"stanox": "AAA", "ts_ms": 0},
+        {"stanox": "BBB", "ts_ms": 320_000},   # 320s later
+        {"stanox": "CCC", "ts_ms": 950_000},   # 630s after that
+    ]
+    preds = simulate_train(stops, net)
+    # Stop 1: horizon = actual_ms - anchor_ms = 320000 - 0 = 320s
+    assert preds[0]["horizon_s"] == 320
+    # Stop 2: horizon = 950000 - 0 = 950s
+    assert preds[1]["horizon_s"] == 950
+
+
+# --- compute_metrics_by_horizon ---
+
+def test_horizon_buckets_split_correctly():
+    # 3 predictions: 60s, 500s, 4000s horizons
+    preds = [
+        {"horizon_s": 60,   "predicted_ms": 0, "actual_ms": 30_000},   # 30s err, ≤5min bucket
+        {"horizon_s": 500,  "predicted_ms": 0, "actual_ms": 90_000},   # 90s err, 5-15min
+        {"horizon_s": 4000, "predicted_ms": 0, "actual_ms": 200_000},  # 200s err, 1-2hr
+    ]
+    rows = compute_metrics_by_horizon(preds)
+    by_label = {r["label"]: r for r in rows}
+
+    assert by_label["≤5 min"]["n"] == 1
+    assert by_label["≤5 min"]["mae_s"] == 30.0
+
+    assert by_label["5-15 min"]["n"] == 1
+    assert by_label["5-15 min"]["mae_s"] == 90.0
+
+    assert by_label["1-2 hr"]["n"] == 1
+    assert by_label["1-2 hr"]["mae_s"] == 200.0
+
+    # Remaining buckets empty
+    assert by_label["15-30 min"]["n"] == 0
+    assert by_label[">4 hr"]["n"] == 0
+
+
+def test_horizon_bias_direction():
+    # All predictions are 60s late (positive bias)
+    preds = [
+        {"horizon_s": 100, "predicted_ms": 160_000, "actual_ms": 100_000}
+        for _ in range(5)
+    ]
+    rows = compute_metrics_by_horizon(preds)
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["≤5 min"]["bias_s"] == pytest.approx(60.0)
+
+
+def test_horizon_no_horizon_s_defaults_to_first_bucket():
+    # Records without horizon_s should fall in ≤5 min bucket
+    preds = [{"predicted_ms": 0, "actual_ms": 10_000}]
+    rows = compute_metrics_by_horizon(preds)
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["≤5 min"]["n"] == 1
+
+
+# --- compute_bias ---
+
+def test_bias_positive_when_predicts_late():
+    preds = [{"predicted_ms": 110_000, "actual_ms": 100_000}]  # pred 10s after actual
+    b = compute_bias(preds)
+    assert b["mean_bias_s"] == pytest.approx(10.0)
+    assert b["late_pct"] == 0.0   # 10s is not > 30s threshold
+
+
+def test_bias_negative_when_predicts_early():
+    preds = [{"predicted_ms": 0, "actual_ms": 60_000}]  # pred 60s before actual
+    b = compute_bias(preds)
+    assert b["mean_bias_s"] == pytest.approx(-60.0)
+    assert b["early_pct"] == 100.0
 
 
 # --- calibrate ---

@@ -6,6 +6,18 @@ import math
 _HEADER = f"{'Metric':<20} {'Rail-sim':>10} {'Darwin':>10} {'Delta':>10}"
 _SEP = "-" * 54
 
+# Horizon buckets: (lo_seconds, hi_seconds_or_None, label)
+# hi=None means "everything above lo"
+HORIZON_BUCKETS: list[tuple[int, int | None, str]] = [
+    (0,     300,   "≤5 min"),
+    (300,   900,   "5-15 min"),
+    (900,   1800,  "15-30 min"),
+    (1800,  3600,  "30-60 min"),
+    (3600,  7200,  "1-2 hr"),
+    (7200,  14400, "2-4 hr"),
+    (14400, None,  ">4 hr"),
+]
+
 
 def compute_metrics(predictions: list[dict]) -> dict:
     """
@@ -78,6 +90,81 @@ def compute_bias(predictions: list[dict]) -> dict:
         "late_pct": round(100 * sum(1 for s in signed if s > 30) / n, 1),
         "early_pct": round(100 * sum(1 for s in signed if s < -30) / n, 1),
     }
+
+
+def compute_metrics_by_horizon(
+    predictions: list[dict],
+    buckets: list[tuple[int, int | None, str]] | None = None,
+) -> list[dict]:
+    """
+    Split predictions by prediction horizon (horizon_s field) and compute
+    MAE, bias, and within-threshold percentages for each bucket.
+
+    For rail-sim, horizon_s = seconds from journey-start anchor to the actual
+    event time — i.e. how far ahead the prediction was made.
+
+    For Darwin snapshots, horizon_s = seconds from snapshot_at to actual arrival.
+
+    Predictions without a horizon_s field are assigned horizon_s=0 and land
+    in the first bucket.
+
+    Returns a list of dicts, one per bucket:
+      {'label': str, 'lo_s': int, 'hi_s': int|None,
+       'n': int, 'mae_s': float, 'bias_s': float,
+       'within_60s_pct': float, 'within_300s_pct': float}
+    """
+    if buckets is None:
+        buckets = HORIZON_BUCKETS
+
+    # Bin each prediction
+    bins: dict[str, list[dict]] = {label: [] for _, _, label in buckets}
+    for p in predictions:
+        h = p.get("horizon_s", 0)
+        for lo, hi, label in buckets:
+            if h >= lo and (hi is None or h < hi):
+                bins[label].append(p)
+                break
+
+    results = []
+    for lo, hi, label in buckets:
+        preds = bins[label]
+        if not preds:
+            results.append({"label": label, "lo_s": lo, "hi_s": hi, "n": 0})
+            continue
+        errors = [abs(p["predicted_ms"] - p["actual_ms"]) / 1000.0 for p in preds]
+        signed = [(p["predicted_ms"] - p["actual_ms"]) / 1000.0 for p in preds]
+        n = len(errors)
+        results.append({
+            "label": label,
+            "lo_s": lo,
+            "hi_s": hi,
+            "n": n,
+            "mae_s": round(sum(errors) / n, 1),
+            "bias_s": round(sum(signed) / n, 1),
+            "within_60s_pct": round(100 * sum(1 for e in errors if e <= 60) / n, 1),
+            "within_300s_pct": round(100 * sum(1 for e in errors if e <= 300) / n, 1),
+        })
+    return results
+
+
+def print_horizon_table(
+    horizon_rows: list[dict],
+    source_label: str = "Rail-sim",
+) -> None:
+    """Print a horizon-breakdown table."""
+    print(f"\n--- Accuracy by prediction horizon ({source_label}) ---")
+    print(f"  {'Horizon':<13} {'n':>7} {'MAE (s)':>9} {'Bias (s)':>10} {'≤60s %':>8} {'≤300s %':>8}")
+    print(f"  {'-'*57}")
+    for row in horizon_rows:
+        if row.get("n", 0) == 0:
+            print(f"  {row['label']:<13} {'—':>7}")
+            continue
+        bias = row.get('bias_s', 0)
+        bias_str = f"{bias:>+.1f}"
+        print(
+            f"  {row['label']:<13} {row['n']:>7,} {row['mae_s']:>9.1f}"
+            f" {bias_str:>10} {row['within_60s_pct']:>8.1f} {row['within_300s_pct']:>8.1f}"
+        )
 
 
 def compute_by_stop_index(trains_with_preds: list[dict]) -> list[dict]:

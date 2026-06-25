@@ -23,7 +23,8 @@ def simulate_train(
         return []
 
     predictions = []
-    current_ms = stops[0]["ts_ms"]
+    anchor_ms = stops[0]["ts_ms"]
+    current_ms = anchor_ms
 
     for i in range(1, len(stops)):
         from_stanox = stops[i - 1]["stanox"]
@@ -31,9 +32,12 @@ def simulate_train(
         base_secs = network.running_time(from_stanox, to_stanox)
         predicted_ms = current_ms + int(base_secs * time_scale * 1000)
         actual_ms = stops[i]["ts_ms"]
+        # horizon_s: how far in the future was this stop when the prediction was made
+        horizon_s = max(0, (actual_ms - anchor_ms) // 1000)
         predictions.append({
             "stanox": to_stanox,
             "stop_index": i,
+            "horizon_s": horizon_s,
             "predicted_ms": predicted_ms,
             "actual_ms": actual_ms,
         })
